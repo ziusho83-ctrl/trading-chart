@@ -130,6 +130,16 @@
   ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
   ::-webkit-scrollbar-thumb:hover{background:var(--text-dim)}
 
+  /* Loading overlay */
+  .loading-overlay{position:absolute;inset:0;background:rgba(19,23,34,.85);z-index:50;display:none;align-items:center;justify-content:center;flex-direction:column;gap:12px}
+  .loading-overlay.visible{display:flex}
+  .spinner{width:28px;height:28px;border:3px solid var(--border);border-top-color:var(--blue);border-radius:50%;animation:spin .7s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .loading-text{font-size:12px;color:var(--text-dim)}
+  .data-source-badge{position:absolute;top:8px;right:80px;z-index:10;font-size:9px;padding:2px 6px;border-radius:3px;pointer-events:none;letter-spacing:0.3px;font-weight:600}
+  .data-source-badge.live{background:rgba(38,166,154,.15);color:var(--green)}
+  .data-source-badge.mock{background:rgba(255,152,0,.15);color:var(--orange)}
+
   @media(max-width:900px){#sidebar{width:240px}.symbol-badge{font-size:15px}}
   @media(max-width:700px){#sidebar{display:none}}
 </style>
@@ -208,6 +218,11 @@
         <canvas id="draw-canvas"></canvas>
         <div class="chart-legend" id="main-legend"></div>
         <div class="draw-mode-label" id="draw-mode-label"></div>
+        <div class="data-source-badge" id="data-badge"></div>
+        <div class="loading-overlay" id="loading">
+          <div class="spinner"></div>
+          <div class="loading-text">Loading data...</div>
+        </div>
       </div>
       <div id="rsi-chart-wrap">
         <span class="chart-label">RSI (14)</span>
@@ -321,86 +336,140 @@ const CHART_OPTS = {
 };
 
 // ============================================================
-// DATA GENERATION
+// YAHOO FINANCE DATA FETCH (with CORS proxy + mock fallback)
 // ============================================================
-function generateOHLCV(ticker, tf) {
+const TF_YAHOO = {
+  '1':   { interval: '1m',  range: '1d' },
+  '5':   { interval: '5m',  range: '5d' },
+  '15':  { interval: '15m', range: '5d' },
+  '60':  { interval: '1h',  range: '1mo' },
+  '240': { interval: '1h',  range: '6mo' },  // aggregate to 4H after fetch
+  'D':   { interval: '1d',  range: '2y' },
+  'W':   { interval: '1wk', range: '5y' },
+};
+
+let lastDataSource = 'mock'; // 'live' or 'mock'
+
+function toYahooSymbol(ticker) {
+  // BTC/USD → BTC-USD, ETH/USD → ETH-USD, etc.
+  return ticker.replace('/', '-');
+}
+
+async function fetchWithProxy(url) {
+  const proxies = [
+    u => 'https://corsproxy.io/?' + encodeURIComponent(u),
+    u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+  ];
+  for (const mkUrl of proxies) {
+    try {
+      const resp = await fetch(mkUrl(url), { signal: AbortSignal.timeout(8000) });
+      if (!resp.ok) continue;
+      const text = await resp.text();
+      return JSON.parse(text);
+    } catch (e) { /* try next proxy */ }
+  }
+  return null;
+}
+
+function aggregate4H(bars) {
+  // Aggregate 1H bars into 4H bars
+  const result = [];
+  for (let i = 0; i < bars.length; i += 4) {
+    const chunk = bars.slice(i, i + 4);
+    if (!chunk.length) break;
+    result.push({
+      time: chunk[0].time,
+      open: chunk[0].open,
+      high: Math.max(...chunk.map(b => b.high)),
+      low: Math.min(...chunk.map(b => b.low)),
+      close: chunk[chunk.length - 1].close,
+      volume: chunk.reduce((s, b) => s + (b.volume || 0), 0),
+    });
+  }
+  return result;
+}
+
+async function fetchOHLCV(ticker, tf) {
+  const yahooSym = toYahooSymbol(ticker);
+  const yCfg = TF_YAHOO[tf];
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=${yCfg.interval}&range=${yCfg.range}`;
+
+  const json = await fetchWithProxy(url);
+  if (!json || !json.chart || !json.chart.result || !json.chart.result[0]) return null;
+
+  const result = json.chart.result[0];
+  const timestamps = result.timestamp;
+  const q = result.indicators.quote[0];
+  if (!timestamps || !q) return null;
+
+  const isIntraday = ['1','5','15','60','240'].includes(tf);
+
+  let data = [];
+  for (let i = 0; i < timestamps.length; i++) {
+    if (q.open[i] == null || q.close[i] == null) continue;
+    let t;
+    if (isIntraday) {
+      t = timestamps[i]; // Unix seconds for intraday
+    } else {
+      const d = new Date(timestamps[i] * 1000);
+      const y = d.getFullYear(), m = d.getMonth() + 1, day = d.getDate();
+      t = `${y}-${String(m).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+    }
+    data.push({
+      time: t,
+      open: +q.open[i].toFixed(4),
+      high: +(q.high[i] || q.open[i]).toFixed(4),
+      low: +(q.low[i] || q.open[i]).toFixed(4),
+      close: +q.close[i].toFixed(4),
+      volume: q.volume[i] || 0,
+    });
+  }
+
+  if (tf === '240') data = aggregate4H(data);
+  if (data.length < 10) return null; // too few bars, treat as failure
+  return data;
+}
+
+// ============================================================
+// MOCK DATA FALLBACK
+// ============================================================
+function generateMockOHLCV(ticker, tf) {
   const cfg = getTickerConfig(ticker);
   const tfCfg = TIMEFRAMES[tf];
   const data = [];
   let price = cfg.price * (0.9 + Math.random() * 0.2);
   const numBars = tfCfg.bars;
-  const isDaily = tf === 'D';
-  const isWeekly = tf === 'W';
-  const isIntraday = !isDaily && !isWeekly;
-
-  // Use a seeded-ish approach: same ticker+tf = same seed
+  const isDaily = tf === 'D', isWeekly = tf === 'W', isIntraday = !isDaily && !isWeekly;
   let seed = 0;
   for (let c = 0; c < ticker.length; c++) seed += ticker.charCodeAt(c);
   seed += tfCfg.minutes;
-  function seededRandom() { seed = (seed * 16807 + 0) % 2147483647; return seed / 2147483647; }
+  function sr() { seed = (seed * 16807) % 2147483647; return seed / 2147483647; }
 
   if (isIntraday) {
-    // Generate intraday bars
-    const now = new Date();
-    now.setHours(16, 0, 0, 0); // market close
-    const startMs = now.getTime() - numBars * tfCfg.minutes * 60 * 1000;
-    let barTime = new Date(startMs);
-    let count = 0;
-
+    const now = new Date(); now.setHours(16,0,0,0);
+    let bt = new Date(now.getTime() - numBars * tfCfg.minutes * 60000), count = 0;
     while (count < numBars) {
-      const hr = barTime.getHours();
-      const dow = barTime.getDay();
-      // Only market hours (9:30-16:00) and weekdays
-      if (dow >= 1 && dow <= 5 && ((hr > 9 || (hr === 9 && barTime.getMinutes() >= 30)) && hr < 16)) {
-        const open = price;
-        const dv = cfg.sigma * (0.3 + seededRandom() * 0.7) * Math.sqrt(tfCfg.minutes / 1440);
-        const r1 = (seededRandom() - 0.5) * 2 * dv;
-        const r2 = (seededRandom() - 0.5) * 2 * dv;
-        const r3 = (seededRandom() - 0.5) * 2 * dv;
-        const close = open * (1 + cfg.mu / (1440 / tfCfg.minutes) + r1);
-        const high = Math.max(open, close) * (1 + Math.abs(r2) * 0.3);
-        const low = Math.min(open, close) * (1 - Math.abs(r3) * 0.3);
-        const volume = Math.floor((200000 + seededRandom() * 800000) * (1 + Math.abs(r1) * 8));
-        data.push({
-          time: Math.floor(barTime.getTime() / 1000),
-          open: +open.toFixed(2), high: +high.toFixed(2), low: +low.toFixed(2), close: +close.toFixed(2), volume,
-        });
-        price = close;
-        count++;
+      const hr = bt.getHours(), dow = bt.getDay();
+      if (dow>=1&&dow<=5&&((hr>9||(hr===9&&bt.getMinutes()>=30))&&hr<16)) {
+        const o=price, dv=cfg.sigma*(0.3+sr()*0.7)*Math.sqrt(tfCfg.minutes/1440);
+        const r1=(sr()-0.5)*2*dv, r2=(sr()-0.5)*2*dv, r3=(sr()-0.5)*2*dv;
+        const c=o*(1+cfg.mu/(1440/tfCfg.minutes)+r1);
+        data.push({ time:Math.floor(bt.getTime()/1000), open:+o.toFixed(2), high:+Math.max(o,c)*(1+Math.abs(r2)*0.3).toFixed(2)===undefined?+(Math.max(o,c)*(1+Math.abs(r2)*0.3)).toFixed(2):+(Math.max(o,c)*(1+Math.abs(r2)*0.3)).toFixed(2), low:+(Math.min(o,c)*(1-Math.abs(r3)*0.3)).toFixed(2), close:+c.toFixed(2), volume:Math.floor((200000+sr()*800000)*(1+Math.abs(r1)*8)) });
+        price=c; count++;
       }
-      barTime = new Date(barTime.getTime() + tfCfg.minutes * 60 * 1000);
+      bt = new Date(bt.getTime()+tfCfg.minutes*60000);
     }
   } else {
-    // Daily or weekly
-    const startDate = new Date('2023-01-03');
-    let dayCount = 0, i = 0;
-    while (dayCount < numBars) {
-      const date = new Date(startDate);
-      if (isWeekly) {
-        date.setDate(date.getDate() + i * 7);
-      } else {
-        date.setDate(date.getDate() + i);
-        const dow = date.getDay();
-        if (dow === 0 || dow === 6) { i++; continue; }
-      }
-      const open = price;
-      const mult = isWeekly ? Math.sqrt(5) : 1;
-      const dv = cfg.sigma * (0.5 + seededRandom()) * mult;
-      const r1 = (seededRandom() - 0.5) * 2 * dv;
-      const r2 = (seededRandom() - 0.5) * 2 * dv;
-      const r3 = (seededRandom() - 0.5) * 2 * dv;
-      const close = open * (1 + cfg.mu * (isWeekly ? 5 : 1) + r1);
-      const high = Math.max(open, close) * (1 + Math.abs(r2) * 0.5);
-      const low = Math.min(open, close) * (1 - Math.abs(r3) * 0.5);
-      const volume = Math.floor((600000 + seededRandom() * 1400000) * (1 + Math.abs(r1) * 10) * (isWeekly ? 5 : 1));
-      const y = date.getFullYear(), m = date.getMonth() + 1, d = date.getDate();
-      data.push({
-        time: `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`,
-        open: +open.toFixed(2), high: +high.toFixed(2), low: +low.toFixed(2), close: +close.toFixed(2), volume,
-      });
-      price = close;
-      dayCount++;
-      i++;
+    const sd = new Date('2023-01-03');
+    let dc=0, i=0;
+    while (dc<numBars) {
+      const date=new Date(sd); if(isWeekly) date.setDate(date.getDate()+i*7); else { date.setDate(date.getDate()+i); if([0,6].includes(date.getDay())){i++;continue;} }
+      const o=price, mult=isWeekly?Math.sqrt(5):1, dv=cfg.sigma*(0.5+sr())*mult;
+      const r1=(sr()-0.5)*2*dv, r2=(sr()-0.5)*2*dv, r3=(sr()-0.5)*2*dv;
+      const c=o*(1+cfg.mu*(isWeekly?5:1)+r1);
+      const y=date.getFullYear(),m=date.getMonth()+1,d=date.getDate();
+      data.push({ time:`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`, open:+o.toFixed(2), high:+(Math.max(o,c)*(1+Math.abs(r2)*0.5)).toFixed(2), low:+(Math.min(o,c)*(1-Math.abs(r3)*0.5)).toFixed(2), close:+c.toFixed(2), volume:Math.floor((600000+sr()*1400000)*(1+Math.abs(r1)*10)*(isWeekly?5:1)) });
+      price=c; dc++; i++;
     }
   }
   return data;
@@ -477,9 +546,17 @@ function calcMACD(data, fast, slow, signal) {
 // ============================================================
 let ohlcv, sma20Data, sma50Data, sma200Data, ema12Data, ema26Data, bbData, rsiCalc, macdCalc, volCalcData;
 let dataByTime = {};
+const loadingEl = document.getElementById('loading');
+const dataBadge = document.getElementById('data-badge');
 
-function computeAll() {
-  ohlcv = generateOHLCV(currentTicker, currentTF);
+function showLoading(v) { loadingEl.classList.toggle('visible', v); }
+function showBadge(src) {
+  lastDataSource = src;
+  dataBadge.textContent = src === 'live' ? 'LIVE' : 'MOCK';
+  dataBadge.className = 'data-source-badge ' + src;
+}
+
+function computeIndicators() {
   dataByTime = {};
   ohlcv.forEach(d => dataByTime[d.time] = d);
   sma20Data = calcSMA(ohlcv, 20);
@@ -492,7 +569,42 @@ function computeAll() {
   macdCalc = calcMACD(ohlcv, 12, 26, 9);
   volCalcData = ohlcv.map(d => ({ time: d.time, value: d.volume, color: d.close >= d.open ? 'rgba(38,166,154,0.35)' : 'rgba(239,83,80,0.35)' }));
 }
-computeAll();
+
+async function computeAll() {
+  showLoading(true);
+  try {
+    const liveData = await fetchOHLCV(currentTicker, currentTF);
+    if (liveData && liveData.length >= 10) {
+      ohlcv = liveData;
+      showBadge('live');
+    } else {
+      ohlcv = generateMockOHLCV(currentTicker, currentTF);
+      showBadge('mock');
+    }
+  } catch (e) {
+    ohlcv = generateMockOHLCV(currentTicker, currentTF);
+    showBadge('mock');
+  }
+  computeIndicators();
+  showLoading(false);
+}
+
+// Initial load
+(async () => {
+  await computeAll();
+  loadAllData();
+  updateMetrics();
+  initPositions();
+  renderPositions();
+  updateMainLegend({}); updateRsiLegend({}); updateMacdLegend({});
+  setTimeout(resizeCharts, 50);
+  setTimeout(resizeCharts, 200);
+  addCurrentPriceLine();
+})();
+
+// Preload with mock while live loads
+ohlcv = generateMockOHLCV(currentTicker, currentTF);
+computeIndicators();
 
 const indState = { sma: true, ema: true, bb: true, vol: true, rsi: true, macd: true };
 
@@ -574,7 +686,6 @@ function loadAllData() {
   rsiChart.timeScale().fitContent();
   macdChart.timeScale().fitContent();
 }
-loadAllData();
 
 // ============================================================
 // TIME SCALE SYNC
@@ -635,7 +746,6 @@ function updateMacdLegend(param) {
 mainChart.subscribeCrosshairMove(p => { updateMainLegend(p); updateRsiLegend(p); updateMacdLegend(p); renderDrawings(); });
 rsiChart.subscribeCrosshairMove(p => updateRsiLegend(p));
 macdChart.subscribeCrosshairMove(p => updateMacdLegend(p));
-updateMainLegend({}); updateRsiLegend({}); updateMacdLegend({});
 
 // ============================================================
 // SIDEBAR
@@ -851,8 +961,8 @@ document.querySelectorAll('.tf-btn').forEach(btn => {
 // ============================================================
 // REBUILD CHART (ticker or TF change)
 // ============================================================
-function rebuildChart() {
-  computeAll();
+async function rebuildChart() {
+  await computeAll();
   loadAllData();
   updateMetrics();
   initPositions();
@@ -860,6 +970,7 @@ function rebuildChart() {
   drawings.length = 0;
   renderDrawings();
   updateMainLegend({}); updateRsiLegend({}); updateMacdLegend({});
+  addCurrentPriceLine();
 }
 
 // ============================================================
@@ -1109,8 +1220,6 @@ function resizeCharts() {
   });
 }
 window.addEventListener('resize', resizeCharts);
-setTimeout(resizeCharts, 50);
-setTimeout(resizeCharts, 200);
 
 // ============================================================
 // PRICE LINE
@@ -1124,7 +1233,6 @@ function addCurrentPriceLine() {
     lineWidth: 1, lineStyle: 2, axisLabelVisible: true,
   });
 }
-addCurrentPriceLine();
 </script>
 </body>
 </html>
